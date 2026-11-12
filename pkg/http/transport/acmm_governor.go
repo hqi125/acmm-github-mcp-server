@@ -384,7 +384,7 @@ func (g *acmmGovernor) persistState() {
 		return
 	}
 	temp := g.config.StateFile + ".tmp"
-	if err := os.WriteFile(temp, append(data, '\n'), 0o600); err != nil {
+	if err := os.WriteFile(temp, append(data, '\n'), 0o644); err != nil {
 		log.Printf("ACMM GitHub MCP governor: cannot write state file: %v", err)
 		return
 	}

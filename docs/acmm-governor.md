@@ -30,6 +30,7 @@ paced centrally.
 - The configured ACMM unadmitted sentinel token is rejected locally with 401
   and never sent to GitHub.
 - Persistent state contains only non-secret traffic telemetry and timing data.
+- The persisted state file is mode `0644` so host-side ACMM observability can read it from the bind mount; it never contains credentials or authorization headers.
 
 ## Environment
 
