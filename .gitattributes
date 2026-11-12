@@ -1,1 +1,6 @@
 .github/workflows/*.lock.yml linguist-generated=true
+
+# Embedded icon data is consumed byte-for-byte by go:embed. Keep LF even when
+# the working tree is checked out on Windows so MCP tool schemas stay stable.
+pkg/octicons/icons_data_uris.txt text eol=lf
+pkg/octicons/required_icons.txt text eol=lf

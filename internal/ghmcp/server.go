@@ -88,7 +88,7 @@ func createGitHubClients(cfg github.MCPServerConfig, apiHost utils.APIHostResolv
 	// into the cache. The hosted, horizontally-scaled server builds a fresh REST
 	// client per request (see pkg/github RequestDeps) and does not use this path.
 	restUATransport := &transport.UserAgentTransport{
-		Transport: &transport.ETagTransport{Transport: http.DefaultTransport},
+		Transport: &transport.ETagTransport{Transport: transport.NewACMMGovernedTransport(http.DefaultTransport)},
 		Agent:     stdioUserAgent(cfg, nil),
 	}
 	restClient, err := newRESTClient(cfg, restUATransport, restURL.String(), uploadURL.String(), allowedHosts)
@@ -102,7 +102,7 @@ func createGitHubClients(cfg github.MCPServerConfig, apiHost utils.APIHostResolv
 		Transport: &transport.BearerAuthTransport{
 			Transport: &transport.GraphQLFeaturesTransport{
 				Transport: &transport.UserAgentTransport{
-					Transport: http.DefaultTransport,
+					Transport: transport.NewACMMGovernedTransport(http.DefaultTransport),
 					Agent:     stdioUserAgent(cfg, nil),
 				},
 			},
@@ -118,7 +118,7 @@ func createGitHubClients(cfg github.MCPServerConfig, apiHost utils.APIHostResolv
 	// uses a transport without the conditional-request cache: raw file bodies can
 	// be large and are streamed rather than retained in memory.
 	rawUATransport := &transport.UserAgentTransport{
-		Transport: http.DefaultTransport,
+		Transport: transport.NewACMMGovernedTransport(http.DefaultTransport),
 		Agent:     stdioUserAgent(cfg, nil),
 	}
 	rawRESTClient, err := newRESTClient(cfg, rawUATransport, restURL.String(), uploadURL.String(), allowedHosts)
@@ -476,7 +476,12 @@ func fetchTokenScopesForHost(ctx context.Context, token, host string) ([]string,
 		return nil, fmt.Errorf("failed to parse API host: %w", err)
 	}
 
-	fetcher := scopes.NewFetcher(apiHost, scopes.FetcherOptions{})
+	fetcher := scopes.NewFetcher(apiHost, scopes.FetcherOptions{
+		HTTPClient: &http.Client{
+			Transport: transport.NewACMMGovernedTransport(http.DefaultTransport),
+			Timeout:   scopes.DefaultFetchTimeout,
+		},
+	})
 
 	return fetcher.FetchTokenScopes(ctx, token)
 }

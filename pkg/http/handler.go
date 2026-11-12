@@ -12,6 +12,7 @@ import (
 	"github.com/github/github-mcp-server/v2/pkg/http/headers"
 	"github.com/github/github-mcp-server/v2/pkg/http/middleware"
 	"github.com/github/github-mcp-server/v2/pkg/http/oauth"
+	"github.com/github/github-mcp-server/v2/pkg/http/transport"
 	"github.com/github/github-mcp-server/v2/pkg/inventory"
 	"github.com/github/github-mcp-server/v2/pkg/scopes"
 	"github.com/github/github-mcp-server/v2/pkg/translations"
@@ -108,7 +109,12 @@ func NewHTTPMcpHandler(
 
 	scopeFetcher := opts.ScopeFetcher
 	if scopeFetcher == nil {
-		scopeFetcher = scopes.NewFetcher(apiHost, scopes.FetcherOptions{})
+		scopeFetcher = scopes.NewFetcher(apiHost, scopes.FetcherOptions{
+			HTTPClient: &http.Client{
+				Transport: transport.NewACMMGovernedTransport(http.DefaultTransport),
+				Timeout:   scopes.DefaultFetchTimeout,
+			},
+		})
 	}
 
 	inventoryFactory := opts.InventoryFactory

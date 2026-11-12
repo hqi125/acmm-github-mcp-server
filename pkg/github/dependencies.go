@@ -361,7 +361,7 @@ func (d *RequestDeps) GetClient(ctx context.Context) (*gogithub.Client, error) {
 	// Construct REST client
 	restClient, err := gogithub.NewClient(
 		gogithub.WithHTTPClient(&http.Client{Transport: &transport.BearerAuthTransport{
-			Transport:    http.DefaultTransport,
+			Transport:    transport.NewACMMGovernedTransport(http.DefaultTransport),
 			Token:        token,
 			AllowedHosts: allowedHosts,
 		}}),
@@ -420,7 +420,7 @@ func (d *RequestDeps) GetGQLClient(ctx context.Context) (*githubv4.Client, error
 	gqlHTTPClient := &http.Client{
 		Transport: &transport.BearerAuthTransport{
 			Transport: &transport.GraphQLFeaturesTransport{
-				Transport: http.DefaultTransport,
+				Transport: transport.NewACMMGovernedTransport(http.DefaultTransport),
 			},
 			Token:        token,
 			AllowedHosts: allowedHosts,

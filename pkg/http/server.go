@@ -18,6 +18,7 @@ import (
 	"github.com/github/github-mcp-server/v2/pkg/github"
 	"github.com/github/github-mcp-server/v2/pkg/http/middleware"
 	"github.com/github/github-mcp-server/v2/pkg/http/oauth"
+	"github.com/github/github-mcp-server/v2/pkg/http/transport"
 	"github.com/github/github-mcp-server/v2/pkg/inventory"
 	"github.com/github/github-mcp-server/v2/pkg/lockdown"
 	"github.com/github/github-mcp-server/v2/pkg/observability"
@@ -167,7 +168,12 @@ func RunHTTPServer(cfg ServerConfig) error {
 	}
 
 	featureChecker := createHTTPFeatureChecker(cfg.EnabledFeatures, cfg.InsidersMode)
-	scopeFetcher := scopes.NewFetcher(apiHost, scopes.FetcherOptions{})
+	scopeFetcher := scopes.NewFetcher(apiHost, scopes.FetcherOptions{
+		HTTPClient: &http.Client{
+			Transport: transport.NewACMMGovernedTransport(http.DefaultTransport),
+			Timeout:   scopes.DefaultFetchTimeout,
+		},
+	})
 	inventoryFactory, err := NewDefaultInventoryFactory(&cfg, t, featureChecker, scopeFetcher)
 	if err != nil {
 		return fmt.Errorf("failed to build inventory: %w", err)
