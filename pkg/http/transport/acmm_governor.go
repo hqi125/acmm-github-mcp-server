@@ -17,8 +17,8 @@ import (
 )
 
 const (
-	acmmGovernorVersion            = "v1"
-	acmmGovernorStateSchemaVersion = "0.1"
+	acmmGovernorVersion            = "v2"
+	acmmGovernorStateSchemaVersion = "0.2"
 	acmmDefaultRequestInterval     = 500 * time.Millisecond
 	acmmDefaultMutationInterval    = 2 * time.Second
 	acmmDefaultRetryGrace          = 3 * time.Second
@@ -42,6 +42,7 @@ type acmmGovernorConfig struct {
 	ResetGrace       time.Duration
 	SecondaryBackoff []time.Duration
 	StateFile        string
+	PPHGateFile      string
 	UnadmittedToken  string
 }
 
@@ -59,6 +60,12 @@ type acmmGovernorState struct {
 	LastRequestAtUnix        float64           `json:"last_request_at_unix,omitempty"`
 	LastMutationAtUnix       float64           `json:"last_mutation_at_unix,omitempty"`
 	MethodCounts             map[string]uint64 `json:"method_counts,omitempty"`
+	RequestKindCounts        map[string]uint64 `json:"request_kind_counts,omitempty"`
+	GateAdmissionCount       uint64            `json:"gate_admission_count"`
+	GateRecoveryCount        uint64            `json:"gate_recovery_count"`
+	GateErrorCount           uint64            `json:"gate_error_count"`
+	GateAdmissionWaitSeconds float64           `json:"gate_admission_wait_seconds"`
+	GateRecoveryWaitSeconds  float64           `json:"gate_recovery_wait_seconds"`
 }
 
 type acmmGovernor struct {
@@ -143,6 +150,19 @@ func (g *acmmGovernor) roundTrip(base http.RoundTripper, req *http.Request) (*ht
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
+	control, active, err := loadACMMGateControl(g.config.PPHGateFile)
+	if err != nil {
+		g.recordGateError()
+		return nil, fmt.Errorf("ACMM PPH gate control unavailable: %w", err)
+	}
+	if active {
+		return g.roundTripGated(base, req, control)
+	}
+
+	return g.roundTripFallback(base, req)
+}
+
+func (g *acmmGovernor) roundTripFallback(base http.RoundTripper, req *http.Request) (*http.Response, error) {
 	for attempt := 0; ; attempt++ {
 		if err := req.Context().Err(); err != nil {
 			return nil, err
@@ -196,6 +216,142 @@ func (g *acmmGovernor) roundTrip(base http.RoundTripper, req *http.Request) (*ht
 		}
 		_ = resp.Body.Close()
 	}
+}
+
+func (g *acmmGovernor) roundTripGated(base http.RoundTripper, req *http.Request, control acmmGateControl) (*http.Response, error) {
+	requestID := acmmGateRequestID(&g.state)
+	admission, err := acmmGateAdmit(req.Context(), control, req, requestID)
+	if err != nil {
+		g.recordGateError()
+		return nil, fmt.Errorf("ACMM PPH gate admission failed closed: %w", err)
+	}
+	g.recordGateAdmission(req, admission)
+
+	for attempt := 0; ; attempt++ {
+		if err := req.Context().Err(); err != nil {
+			_ = acmmGateCancel(context.Background(), control, requestID, err.Error())
+			return nil, err
+		}
+
+		outbound, bodyReplayable, err := cloneACMMRequest(req, attempt > 0)
+		if err != nil {
+			_ = acmmGateCancel(context.Background(), control, requestID, err.Error())
+			return nil, err
+		}
+		g.recordDispatch(req.Method)
+		resp, err := base.RoundTrip(outbound)
+		if err != nil {
+			feedback, feedbackErr := acmmGateFeedbackError(req.Context(), control, req, requestID, attempt, err)
+			if feedbackErr != nil {
+				g.recordGateError()
+				return nil, fmt.Errorf("GitHub request failed (%v) and ACMM PPH gate feedback failed closed: %w", err, feedbackErr)
+			}
+			g.recordGateFeedback(feedback)
+			return resp, err
+		}
+
+		feedback, err := acmmGateFeedback(req.Context(), control, req, requestID, attempt, resp)
+		if err != nil {
+			g.recordGateError()
+			_ = resp.Body.Close()
+			return nil, fmt.Errorf("ACMM PPH gate feedback failed closed: %w", err)
+		}
+		g.recordGateFeedback(feedback)
+		if !feedback.Retry {
+			return resp, nil
+		}
+
+		if !bodyReplayable {
+			_ = acmmGateCancel(context.Background(), control, requestID, "request body is not replayable")
+			return resp, nil
+		}
+		if err := req.Context().Err(); err != nil {
+			_ = resp.Body.Close()
+			_ = acmmGateCancel(context.Background(), control, requestID, err.Error())
+			return nil, err
+		}
+		_ = resp.Body.Close()
+	}
+}
+
+func (g *acmmGovernor) recordGateAdmission(req *http.Request, admission acmmGateAdmitResponse) {
+	g.state.GateAdmissionCount++
+	kind := strings.TrimPrefix(strings.TrimSpace(admission.ActionID), "mcp.")
+	if kind == "" {
+		kind = "other"
+		if req != nil {
+			kind = acmmTransportKind(req.URL)
+			if acmmMutationMethod(req.Method) {
+				kind += ".mutation"
+			} else {
+				kind += ".read"
+			}
+		}
+	}
+	if g.state.RequestKindCounts == nil {
+		g.state.RequestKindCounts = make(map[string]uint64)
+	}
+	g.state.RequestKindCounts[kind]++
+	if wait := acmmMapFloat(admission.Admission, "recommended_wait_seconds"); wait > 0 {
+		g.state.GateAdmissionWaitSeconds += wait
+	}
+	g.persistState()
+}
+
+func (g *acmmGovernor) recordGateFeedback(feedback acmmGateFeedbackResponse) {
+	if len(feedback.Recovery) != 0 {
+		g.state.GateRecoveryCount++
+		if wait := acmmMapFloat(feedback.Recovery, "provider_wait_seconds"); wait > 0 {
+			g.state.GateRecoveryWaitSeconds += wait
+		}
+		kind := strings.TrimSpace(acmmMapString(feedback.Recovery, "provider_recovery_kind"))
+		now := time.Now()
+		g.state.LastRateLimitKind = kind
+		g.state.LastRateLimitAtUnix = acmmUnixFloat(now)
+		switch kind {
+		case "primary":
+			g.state.PrimaryRateLimitEvents++
+		case "secondary":
+			g.state.SecondaryRateLimitEvents++
+		}
+	}
+	g.persistState()
+}
+
+func (g *acmmGovernor) recordGateError() {
+	g.state.GateErrorCount++
+	g.persistState()
+}
+
+func acmmMapFloat(value map[string]any, key string) float64 {
+	raw, ok := value[key]
+	if !ok {
+		return 0
+	}
+	switch typed := raw.(type) {
+	case float64:
+		return typed
+	case float32:
+		return float64(typed)
+	case int:
+		return float64(typed)
+	case int64:
+		return float64(typed)
+	case json.Number:
+		parsed, _ := typed.Float64()
+		return parsed
+	default:
+		return 0
+	}
+}
+
+func acmmMapString(value map[string]any, key string) string {
+	raw, ok := value[key]
+	if !ok {
+		return ""
+	}
+	rendered, _ := raw.(string)
+	return rendered
 }
 
 func (g *acmmGovernor) waitForCooldown(ctx context.Context) error {
@@ -356,7 +512,7 @@ func (g *acmmGovernor) loadState() {
 		log.Printf("ACMM GitHub MCP governor: cannot decode state file: %v", err)
 		return
 	}
-	if state.SchemaVersion != "" && state.SchemaVersion != acmmGovernorStateSchemaVersion {
+	if state.SchemaVersion != "" && state.SchemaVersion != acmmGovernorStateSchemaVersion && state.SchemaVersion != "0.1" {
 		log.Printf("ACMM GitHub MCP governor: ignoring unsupported state schema %q", state.SchemaVersion)
 		return
 	}
@@ -421,6 +577,7 @@ func loadACMMGovernorConfig() acmmGovernorConfig {
 		ResetGrace:       resetGrace,
 		SecondaryBackoff: secondaryBackoff,
 		StateFile:        strings.TrimSpace(os.Getenv("ACMM_GITHUB_MCP_GOVERNOR_STATE_FILE")),
+		PPHGateFile:      acmmEnvString("ACMM_GITHUB_MCP_PPH_GATE_FILE", acmmDefaultPPHGateFile),
 		UnadmittedToken:  strings.TrimSpace(os.Getenv("ACMM_GITHUB_MCP_UNADMITTED_TOKEN")),
 	}
 }
@@ -437,6 +594,14 @@ func acmmSecondaryBackoffConfig(candidate []time.Duration) []time.Duration {
 		result[i] = duration
 	}
 	return result
+}
+
+func acmmEnvString(name string, fallback string) string {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return fallback
+	}
+	return value
 }
 
 func acmmEnvBool(name string, fallback bool) bool {

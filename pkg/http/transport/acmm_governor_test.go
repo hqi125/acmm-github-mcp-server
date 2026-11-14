@@ -3,8 +3,10 @@ package transport
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"sync"
@@ -381,5 +383,174 @@ func TestACMMStateFileContainsNoAuthorizationSecret(t *testing.T) {
 	}
 	if bytes.Contains(contents, []byte("highly-sensitive-test-token")) || bytes.Contains(contents, []byte("Authorization")) {
 		t.Fatal("governor state persisted credential material")
+	}
+}
+
+func writeACMMGateControl(t *testing.T, path string, serverURL string) {
+	t.Helper()
+	value := map[string]any{
+		"schema_version": "0.1",
+		"active":         true,
+		"url":            serverURL,
+		"token":          "test-gate-token",
+		"provider_id":    "github",
+		"execution_id":   "execution-test",
+	}
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, append(data, '\n'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestACMMActivePPHGateBypassesLocalSpacing(t *testing.T) {
+	admissions := 0
+	feedbacks := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer test-gate-token" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/admit":
+			admissions++
+			_, _ = io.WriteString(w, `{"schema_version":"0.1","request_id":"request-1","action_id":"mcp.rest.mutation","decision_id":"decision-1","admission":{"recommended_wait_seconds":0}}`)
+		case "/v1/feedback":
+			feedbacks++
+			_, _ = io.WriteString(w, `{"schema_version":"0.1","request_id":"request-1","action_id":"mcp.rest.mutation","decision_id":"decision-1","retry":false,"result":{"outcome":"success"}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	dir := t.TempDir()
+	control := filepath.Join(dir, "pph-gate.json")
+	writeACMMGateControl(t, control, server.URL)
+	g := newACMMGovernor(acmmGovernorConfig{
+		Enabled:          true,
+		RequestInterval:  5 * time.Second,
+		MutationInterval: 5 * time.Second,
+		RetryGrace:       0,
+		ResetGrace:       0,
+		SecondaryBackoff: []time.Duration{time.Second},
+		StateFile:        filepath.Join(dir, "governor.json"),
+		PPHGateFile:      control,
+	})
+	g.lastRequestAt = time.Now()
+	g.lastMutationAt = time.Now()
+
+	baseCalls := 0
+	base := acmmRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		baseCalls++
+		return acmmResponse(http.StatusOK, nil, `{}`), nil
+	})
+	req, _ := http.NewRequest(http.MethodPost, "https://api.github.com/test", bytes.NewBufferString(`{}`))
+	started := time.Now()
+	resp, err := g.roundTrip(base, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if elapsed := time.Since(started); elapsed >= time.Second {
+		t.Fatalf("gated request inherited local spacing: elapsed=%s", elapsed)
+	}
+	if admissions != 1 || feedbacks != 1 || baseCalls != 1 {
+		t.Fatalf("admit/feedback/upstream=%d/%d/%d, want 1/1/1", admissions, feedbacks, baseCalls)
+	}
+	if g.state.GateAdmissionCount != 1 {
+		t.Fatalf("gate admissions=%d, want 1", g.state.GateAdmissionCount)
+	}
+}
+
+func TestACMMActivePPHGateFailsClosedBeforeGitHub(t *testing.T) {
+	dir := t.TempDir()
+	control := filepath.Join(dir, "pph-gate.json")
+	writeACMMGateControl(t, control, "http://127.0.0.1:1")
+	g := newACMMGovernor(acmmGovernorConfig{
+		Enabled:          true,
+		SecondaryBackoff: []time.Duration{time.Second},
+		PPHGateFile:      control,
+	})
+	baseCalls := 0
+	base := acmmRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		baseCalls++
+		return acmmResponse(http.StatusOK, nil, `{}`), nil
+	})
+	req, _ := http.NewRequest(http.MethodGet, "https://api.github.com/test", nil)
+	resp, err := g.roundTrip(base, req)
+	if resp != nil {
+		resp.Body.Close()
+	}
+	if err == nil {
+		t.Fatal("expected gate failure")
+	}
+	if baseCalls != 0 {
+		t.Fatalf("upstream calls=%d, want 0", baseCalls)
+	}
+	if g.state.GateErrorCount != 1 {
+		t.Fatalf("gate errors=%d, want 1", g.state.GateErrorCount)
+	}
+}
+
+func TestACMMGatedRecoveryRetriesUnderOneAdmission(t *testing.T) {
+	admissions := 0
+	feedbacks := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/admit":
+			admissions++
+			_, _ = io.WriteString(w, `{"schema_version":"0.1","request_id":"request-1","action_id":"mcp.rest.mutation","decision_id":"decision-1","admission":{"recommended_wait_seconds":0}}`)
+		case "/v1/feedback":
+			feedbacks++
+			if feedbacks == 1 {
+				_, _ = io.WriteString(w, `{"schema_version":"0.1","request_id":"request-1","action_id":"mcp.rest.mutation","decision_id":"decision-1","retry":true,"recovery":{"provider_recovery_kind":"secondary","provider_wait_seconds":60}}`)
+				return
+			}
+			_, _ = io.WriteString(w, `{"schema_version":"0.1","request_id":"request-1","action_id":"mcp.rest.mutation","decision_id":"decision-1","retry":false,"result":{"outcome":"success"}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	dir := t.TempDir()
+	control := filepath.Join(dir, "pph-gate.json")
+	writeACMMGateControl(t, control, server.URL)
+	g := newACMMGovernor(acmmGovernorConfig{
+		Enabled:          true,
+		SecondaryBackoff: []time.Duration{time.Second},
+		StateFile:        filepath.Join(dir, "governor.json"),
+		PPHGateFile:      control,
+	})
+	upstreamCalls := 0
+	base := acmmRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		upstreamCalls++
+		if upstreamCalls == 1 {
+			return acmmResponse(http.StatusTooManyRequests, nil, `{"message":"secondary rate limit"}`), nil
+		}
+		return acmmResponse(http.StatusOK, nil, `{}`), nil
+	})
+	req, _ := http.NewRequest(http.MethodPost, "https://api.github.com/test", bytes.NewBufferString(`{"x":1}`))
+	resp, err := g.roundTrip(base, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d, want 200", resp.StatusCode)
+	}
+	if admissions != 1 || feedbacks != 2 || upstreamCalls != 2 {
+		t.Fatalf("admit/feedback/upstream=%d/%d/%d, want 1/2/2", admissions, feedbacks, upstreamCalls)
+	}
+	if g.state.GateRecoveryCount != 1 || g.state.SecondaryRateLimitEvents != 1 {
+		t.Fatalf("gate recovery/secondary=%d/%d, want 1/1", g.state.GateRecoveryCount, g.state.SecondaryRateLimitEvents)
+	}
+	if g.state.GateRecoveryWaitSeconds != 60 {
+		t.Fatalf("gate recovery wait=%f, want 60", g.state.GateRecoveryWaitSeconds)
 	}
 }

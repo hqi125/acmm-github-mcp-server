@@ -47,7 +47,7 @@ FROM gcr.io/distroless/base-debian12@sha256:fabbf1c0c357a3d42550111351daed089b20
 ARG ACMM_UPSTREAM_VERSION="v2.1.0"
 ARG ACMM_UPSTREAM_COMMIT="4bcdcdf8d7beee98c9448e73e257308280924cc4"
 ARG ACMM_SOURCE_COMMIT="unknown"
-ARG ACMM_GOVERNOR_VERSION="v1"
+ARG ACMM_GOVERNOR_VERSION="v2"
 
 # Add required MCP server annotation and ACMM provenance labels.
 LABEL io.modelcontextprotocol.server.name="io.github.github/github-mcp-server" \
