@@ -496,7 +496,7 @@ func TestACMMActivePPHGateFailsClosedBeforeGitHub(t *testing.T) {
 	}
 }
 
-func TestACMMGatedRecoveryRetriesUnderOneAdmission(t *testing.T) {
+func TestACMMGatedReadRecoveryRetriesUnderOneAdmission(t *testing.T) {
 	admissions := 0
 	feedbacks := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -504,14 +504,14 @@ func TestACMMGatedRecoveryRetriesUnderOneAdmission(t *testing.T) {
 		switch r.URL.Path {
 		case "/v1/admit":
 			admissions++
-			_, _ = io.WriteString(w, `{"schema_version":"0.1","request_id":"request-1","action_id":"mcp.rest.mutation","decision_id":"decision-1","admission":{"recommended_wait_seconds":0}}`)
+			_, _ = io.WriteString(w, `{"schema_version":"0.1","request_id":"request-1","action_id":"mcp.rest.read","decision_id":"decision-1","admission":{"recommended_wait_seconds":0}}`)
 		case "/v1/feedback":
 			feedbacks++
 			if feedbacks == 1 {
-				_, _ = io.WriteString(w, `{"schema_version":"0.1","request_id":"request-1","action_id":"mcp.rest.mutation","decision_id":"decision-1","retry":true,"recovery":{"provider_recovery_kind":"secondary","provider_wait_seconds":60}}`)
+				_, _ = io.WriteString(w, `{"schema_version":"0.1","request_id":"request-1","action_id":"mcp.rest.read","decision_id":"decision-1","retry":true,"recovery":{"provider_recovery_kind":"secondary","provider_wait_seconds":60}}`)
 				return
 			}
-			_, _ = io.WriteString(w, `{"schema_version":"0.1","request_id":"request-1","action_id":"mcp.rest.mutation","decision_id":"decision-1","retry":false,"result":{"outcome":"success"}}`)
+			_, _ = io.WriteString(w, `{"schema_version":"0.1","request_id":"request-1","action_id":"mcp.rest.read","decision_id":"decision-1","retry":false,"result":{"outcome":"success"}}`)
 		default:
 			http.NotFound(w, r)
 		}
@@ -535,7 +535,7 @@ func TestACMMGatedRecoveryRetriesUnderOneAdmission(t *testing.T) {
 		}
 		return acmmResponse(http.StatusOK, nil, `{}`), nil
 	})
-	req, _ := http.NewRequest(http.MethodPost, "https://api.github.com/test", bytes.NewBufferString(`{"x":1}`))
+	req, _ := http.NewRequest(http.MethodGet, "https://api.github.com/test", nil)
 	resp, err := g.roundTrip(base, req)
 	if err != nil {
 		t.Fatal(err)
@@ -552,5 +552,66 @@ func TestACMMGatedRecoveryRetriesUnderOneAdmission(t *testing.T) {
 	}
 	if g.state.GateRecoveryWaitSeconds != 60 {
 		t.Fatalf("gate recovery wait=%f, want 60", g.state.GateRecoveryWaitSeconds)
+	}
+}
+
+func TestACMMGateRetrySafetyAllowsGraphQLQueryButNotMutation(t *testing.T) {
+	query, _ := http.NewRequest(http.MethodPost, "https://api.github.com/graphql", bytes.NewBufferString(`{"query":"query { viewer { login } }"}`))
+	if !acmmGateRetrySafeRequest(query) {
+		t.Fatal("GraphQL query should be retry-safe")
+	}
+
+	mutation, _ := http.NewRequest(http.MethodPost, "https://api.github.com/graphql", bytes.NewBufferString(`{"query":"mutation { addStar(input: {starrableId: \"x\"}) { starrable { id } } }"}`))
+	if acmmGateRetrySafeRequest(mutation) {
+		t.Fatal("GraphQL mutation must not be retry-safe")
+	}
+}
+
+func TestACMMGatedRecoveryNeverReplaysMutation(t *testing.T) {
+	admissions := 0
+	feedbacks := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/admit":
+			admissions++
+			_, _ = io.WriteString(w, `{"schema_version":"0.1","request_id":"request-1","action_id":"mcp.rest.mutation","decision_id":"decision-1","admission":{"recommended_wait_seconds":0}}`)
+		case "/v1/feedback":
+			feedbacks++
+			_, _ = io.WriteString(w, `{"schema_version":"0.1","request_id":"request-1","action_id":"mcp.rest.mutation","decision_id":"decision-1","retry":true,"recovery":{"provider_recovery_kind":"secondary","provider_wait_seconds":60}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	dir := t.TempDir()
+	control := filepath.Join(dir, "pph-gate.json")
+	writeACMMGateControl(t, control, server.URL)
+	g := newACMMGovernor(acmmGovernorConfig{
+		Enabled:          true,
+		SecondaryBackoff: []time.Duration{time.Second},
+		StateFile:        filepath.Join(dir, "governor.json"),
+		PPHGateFile:      control,
+	})
+	upstreamCalls := 0
+	base := acmmRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		upstreamCalls++
+		return acmmResponse(http.StatusTooManyRequests, nil, `{"message":"secondary rate limit"}`), nil
+	})
+	req, _ := http.NewRequest(http.MethodPost, "https://api.github.com/test", bytes.NewBufferString(`{"x":1}`))
+	resp, err := g.roundTrip(base, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status=%d, want 429", resp.StatusCode)
+	}
+	if admissions != 1 || feedbacks != 1 || upstreamCalls != 1 {
+		t.Fatalf("admit/feedback/upstream=%d/%d/%d, want 1/1/1", admissions, feedbacks, upstreamCalls)
+	}
+	if g.state.GateRecoveryCount != 1 || g.state.SecondaryRateLimitEvents != 1 {
+		t.Fatalf("gate recovery/secondary=%d/%d, want 1/1", g.state.GateRecoveryCount, g.state.SecondaryRateLimitEvents)
 	}
 }

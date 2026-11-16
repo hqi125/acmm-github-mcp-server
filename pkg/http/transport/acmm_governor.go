@@ -261,6 +261,13 @@ func (g *acmmGovernor) roundTripGated(base http.RoundTripper, req *http.Request,
 			return resp, nil
 		}
 
+		// The Core gate owns recovery timing, but it cannot authorize an
+		// ambiguous write replay. Preserve the transport's no-mutation-replay
+		// invariant even if a malformed or regressed gate response says retry.
+		if !acmmGateRetrySafeRequest(req) {
+			return resp, nil
+		}
+
 		if !bodyReplayable {
 			_ = acmmGateCancel(context.Background(), control, requestID, "request body is not replayable")
 			return resp, nil

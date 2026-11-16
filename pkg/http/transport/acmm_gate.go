@@ -213,6 +213,20 @@ func acmmTransportKind(value *url.URL) string {
 	return "other"
 }
 
+func acmmGateRetrySafeRequest(req *http.Request) bool {
+	if req == nil {
+		return false
+	}
+	switch strings.ToUpper(strings.TrimSpace(req.Method)) {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return true
+	case http.MethodPost:
+		return acmmGraphQLOperation(req) == "query"
+	default:
+		return false
+	}
+}
+
 func acmmGraphQLOperation(req *http.Request) string {
 	if req == nil || req.URL == nil || req.URL.Path != "/graphql" || req.GetBody == nil {
 		return ""

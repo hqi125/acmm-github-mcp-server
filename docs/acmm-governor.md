@@ -22,15 +22,26 @@ paced centrally.
   1, 2, 4, 8 and 16 minutes. After the configured sequence is exhausted, the
   provider response is returned rather than continuing to retry.
 - Mutative requests are never automatically replayed. A rate-limit response
-  records the cooldown and is returned to the caller.
-- Safe read-like methods (GET, HEAD and OPTIONS) may retry after an explicit
-  rate-limit response when their body is replayable.
+  records/actuates recovery and is returned to the caller, even if an active
+  Core gate mistakenly requests a retry.
+- Safe read-like methods (GET, HEAD and OPTIONS) and classified GraphQL queries
+  may retry after an explicit rate-limit response when their body is replayable.
 - Context cancellation aborts governor waiting and prevents a cancelled action
   from dispatching or being replayed.
 - The configured ACMM unadmitted sentinel token is rejected locally with 401
   and never sent to GitHub.
 - Persistent state contains only non-secret traffic telemetry and timing data.
 - The persisted state file is mode `0644` so host-side ACMM observability can read it from the bind mount; it never contains credentials or authorization headers.
+
+## Active Core gate
+
+When `ACMM_GITHUB_MCP_PPH_GATE_FILE` points to an active ACMM gate control, the
+transport asks Core for admission before each GitHub request and returns provider
+feedback to the same decision. Local request/mutation spacing and cooldown sleeps
+are bypassed while the gate is active so pacing is actuated only once. Gate loss
+or malformed gate responses fail closed before additional provider traffic. The
+transport still enforces its non-replayable mutation boundary locally; Core may
+request replay only for retry-safe reads.
 
 ## Environment
 
