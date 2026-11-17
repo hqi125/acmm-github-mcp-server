@@ -615,3 +615,87 @@ func TestACMMGatedRecoveryNeverReplaysMutation(t *testing.T) {
 		t.Fatalf("gate recovery/secondary=%d/%d, want 1/1", g.state.GateRecoveryCount, g.state.SecondaryRateLimitEvents)
 	}
 }
+
+func TestACMMGateFeedbackControlRetryDoesNotReplayGitHub(t *testing.T) {
+	var mu sync.Mutex
+	admissions := 0
+	feedbacks := 0
+	var feedbackBodies [][]byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/admit":
+			mu.Lock()
+			admissions++
+			mu.Unlock()
+			_, _ = io.WriteString(w, `{"schema_version":"0.1","request_id":"request-1","action_id":"mcp.rest.read","decision_id":"decision-1","admission":{"recommended_wait_seconds":0}}`)
+		case "/v1/feedback":
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			mu.Lock()
+			feedbacks++
+			current := feedbacks
+			feedbackBodies = append(feedbackBodies, append([]byte(nil), body...))
+			mu.Unlock()
+			if current == 1 {
+				hijacker, ok := w.(http.Hijacker)
+				if !ok {
+					http.Error(w, "hijacking unavailable", http.StatusInternalServerError)
+					return
+				}
+				conn, _, err := hijacker.Hijack()
+				if err != nil {
+					return
+				}
+				_ = conn.Close()
+				return
+			}
+			_, _ = io.WriteString(w, `{"schema_version":"0.1","request_id":"request-1","action_id":"mcp.rest.read","decision_id":"decision-1","retry":false,"result":{"outcome":"success"}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	dir := t.TempDir()
+	control := filepath.Join(dir, "pph-gate.json")
+	writeACMMGateControl(t, control, server.URL)
+	g := newACMMGovernor(acmmGovernorConfig{
+		Enabled:          true,
+		SecondaryBackoff: []time.Duration{time.Second},
+		StateFile:        filepath.Join(dir, "governor.json"),
+		PPHGateFile:      control,
+	})
+	upstreamCalls := 0
+	base := acmmRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		upstreamCalls++
+		return acmmResponse(http.StatusOK, nil, `{}`), nil
+	})
+	req, _ := http.NewRequest(http.MethodGet, "https://api.github.com/test", nil)
+	resp, err := g.roundTrip(base, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d, want 200", resp.StatusCode)
+	}
+
+	mu.Lock()
+	gotAdmissions := admissions
+	gotFeedbacks := feedbacks
+	bodies := append([][]byte(nil), feedbackBodies...)
+	mu.Unlock()
+	if gotAdmissions != 1 || gotFeedbacks != 2 || upstreamCalls != 1 {
+		t.Fatalf("admit/feedback/upstream=%d/%d/%d, want 1/2/1", gotAdmissions, gotFeedbacks, upstreamCalls)
+	}
+	if len(bodies) != 2 || !bytes.Equal(bodies[0], bodies[1]) {
+		t.Fatal("control-plane feedback retry changed the idempotent payload")
+	}
+	if g.state.GateErrorCount != 0 {
+		t.Fatalf("gate errors=%d, want 0 after successful control retry", g.state.GateErrorCount)
+	}
+}
